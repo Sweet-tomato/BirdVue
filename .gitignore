@@ -1,0 +1,21 @@
+# 运行数据与模型（体积大、非源码）
+.venv/
+models/
+data/
+logs/
+*.log
+rollout_service.log
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 备份与归档
+*.bak
+*.tar.gz
+*.zip
+
+# 密钥：真实 env 不入库，只保留示例
+config/*.env
+config/service.env
+.env

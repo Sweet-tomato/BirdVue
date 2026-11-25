@@ -1,0 +1,32 @@
+[Unit]
+Description=Bird frames identification service (uvicorn :8000)
+Documentation=file:///root/bird_service/PRODUCTION.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root/bird_service
+Environment=PATH=/root/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/root/bird_service/config/service.env
+ExecStart=/root/bird_service/start_service.sh
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+KillSignal=SIGTERM
+StandardOutput=append:/root/bird_service/logs/uvicorn.log
+StandardError=append:/root/bird_service/logs/uvicorn.log
+
+# 加固：只允许写 data/ 与 logs/
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/root/bird_service/data /root/bird_service/logs
+
+[Install]
+WantedBy=multi-user.target

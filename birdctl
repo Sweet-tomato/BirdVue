@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+# birdctl - 图片识别与音频识别两个独立服务的快捷命令
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
+PY=/root/venv/bin/python
+SESSION=bird
+AUDIO_SESSION=bird-audio
+BASE="http://127.0.0.1:${BIRD_PORT:-8000}"
+AUDIO_BASE="http://127.0.0.1:${BIRD_AUDIO_PORT:-8001}"
+
+for f in config/service.env config/doubao.env; do
+  if [ -f "$f" ]; then set -a; . "$f"; set +a; fi
+done
+AUTH=()
+[ -n "${BIRD_API_KEY:-}" ] && AUTH=(-H "Authorization: Bearer $BIRD_API_KEY")
+
+die() { echo "错误: $*" >&2; exit 1; }
+ready() { curl -sf -m 2 "$BASE/health/ready" >/dev/null 2>&1; }
+audio_ready() { curl -sf -m 2 "$AUDIO_BASE/health/ready" >/dev/null 2>&1; }
+
+wait_ready() {
+  local host="$1"
+  for _ in $(seq 1 90); do
+    curl -sf -m 2 "$host/health/ready" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+kill_service() {
+  local session="$1" pattern="$2"
+  screen -ls 2>/dev/null | grep -q "\.$session" && screen -S "$session" -X quit || true
+  pkill -f "$pattern" 2>/dev/null || true
+}
+
+start_image() {
+  screen -dmS "$SESSION" bash -c "cd '$ROOT' && exec ./start_service.sh"
+  wait_ready "$BASE" && echo "图片识别已启动: $BASE" || { echo "图片识别启动超时，查看 ./birdctl log"; return 1; }
+}
+
+start_audio() {
+  if [ "${BIRD_AUDIO_ENABLED:-1}" = "0" ]; then echo "音频识别已禁用（BIRD_AUDIO_ENABLED=0）"; return 0; fi
+  screen -dmS "$AUDIO_SESSION" bash -c "cd '$ROOT' && exec ./start_audio.sh"
+  wait_ready "$AUDIO_BASE" && echo "音频识别已启动: $AUDIO_BASE" || { echo "音频识别启动超时，查看 ./birdctl audio-log"; return 1; }
+}
+
+cmd_restart() {
+  case "${1:-all}" in
+    image) kill_service "$SESSION" "uvicorn api.bird_frames_service:app"; sleep 1; start_image ;;
+    audio) kill_service "$AUDIO_SESSION" "uvicorn api.bird_audio_service:app"; sleep 1; start_audio ;;
+    all)
+      kill_service "$SESSION" "uvicorn api.bird_frames_service:app"
+      kill_service "$AUDIO_SESSION" "uvicorn api.bird_audio_service:app"
+      sleep 1; start_image; start_audio ;;
+    *) die "用法: birdctl restart [image|audio|all]" ;;
+  esac
+}
+
+cmd_status() {
+  echo "--- 图片识别 $BASE ---"
+  pgrep -af "uvicorn api.bird_frames_service" || echo "未运行"
+  curl -s -m 3 "$BASE/health/ready" || true; echo
+  curl -s -m 3 "$BASE/health/state" || true; echo
+  echo "--- 音频识别 $AUDIO_BASE ---"
+  pgrep -af "uvicorn api.bird_audio_service" || echo "未运行"
+  curl -s -m 3 "$AUDIO_BASE/health/ready" || true; echo
+  curl -s -m 3 "$AUDIO_BASE/health/state" || true; echo
+}
+
+cmd_submit() {
+  [ $# -ge 1 ] || die "用法: birdctl submit <图片URL> [图片2] [图片3]"
+  local payload resp id
+  payload=$("$PY" -c 'import json,sys;print(json.dumps({"files":sys.argv[1:]},ensure_ascii=False))' "$@")
+  resp=$(curl -s -X POST "$BASE/v1/jobs" "${AUTH[@]}" -H 'Content-Type: application/json' -d "$payload")
+  echo "$resp" | "$PY" -m json.tool 2>/dev/null || echo "$resp"
+  id=$(echo "$resp" | "$PY" -c 'import sys,json;print(json.load(sys.stdin).get("requestId",""))' 2>/dev/null || true)
+  [ -n "$id" ] && echo && echo "查询结果: ./birdctl result $id"
+}
+
+cmd_result() {
+  local id="${1:-}"; [ -n "$id" ] || die "用法: birdctl result <requestId>"
+  local body status
+  for _ in $(seq 1 5); do
+    body=$(curl -s -m 90 "$BASE/v1/results/$id" "${AUTH[@]}")
+    status=$(echo "$body" | "$PY" -c 'import sys,json;print(json.load(sys.stdin).get("status",""))' 2>/dev/null || true)
+    case "$status" in
+      ok|error) echo "$body" | "$PY" -m json.tool; return ;;
+      *) printf '\r等待中... %s' "${status:-unknown}" >&2; sleep 2 ;;
+    esac
+  done
+  echo; echo "仍未完成，稍后再查: ./birdctl result $id"
+}
+
+cmd_audio_submit() {
+  local url="${1:-}"; [ -n "$url" ] || die "用法: birdctl audio-submit <音频URL>"
+  local payload body
+  payload=$("$PY" -c 'import json,sys;print(json.dumps({"audioUrls":[sys.argv[1]]},ensure_ascii=False))' "$url")
+  body=$(curl -s -m 180 -X POST "$AUDIO_BASE/v1/audio/identify" "${AUTH[@]}" \
+    -H 'Content-Type: application/json' -d "$payload")
+  echo "$body" | "$PY" -m json.tool 2>/dev/null || echo "$body"
+}
+
+cmd_audio() {
+  case "${1:-}" in
+    on)  audio_ready && echo "音频识别已在运行: $AUDIO_BASE" || start_audio ;;
+    off) kill_service "$AUDIO_SESSION" "uvicorn api.bird_audio_service:app"; echo "音频识别已停止" ;;
+    *)   echo "图片识别: $(ready && echo running || echo stopped)"; echo "音频识别: $(audio_ready && echo running || echo stopped)"; echo "用法: ./birdctl audio on|off" ;;
+  esac
+}
+
+cmd_stats() {
+  local days="${1:-0}"
+  "$PY" - "$ROOT/data/audio" "$days" <<'EOF'
+import json, sys, time
+from pathlib import Path
+from collections import Counter
+
+root, days = Path(sys.argv[1]), int(sys.argv[2])
+cutoff = time.time() - days * 86400 if days else 0
+status, noise, species = Counter(), Counter(), Counter()
+ratios, confs, durations = [], [], []
+
+for path in root.glob("*/*/*/result.json"):
+    if cutoff and path.stat().st_mtime < cutoff:
+        continue
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        continue
+    status[data.get("status")] += 1
+    noise[data.get("noiseDominant") or "-"] += 1
+    if data.get("acceptedRatio") is not None:
+        ratios.append(float(data["acceptedRatio"]))
+    if data.get("durationSeconds") is not None:
+        durations.append(float(data["durationSeconds"]))
+    top5 = data.get("top5") or []
+    if top5:
+        species[top5[0].get("scientificName")] += 1
+        confs.append(float(top5[0].get("confidence") or 0))
+
+def med(xs):
+    xs = sorted(xs)
+    return round(xs[len(xs) // 2], 3) if xs else None
+
+total = sum(status.values())
+print(f"音频事件总数: {total}")
+if not total:
+    print("还没有音频识别记录。")
+    raise SystemExit
+print("状态    :", dict(status))
+print("噪音主导:", dict(noise))
+print(f"acceptedRatio 中位数: {med(ratios)}    top1 置信度中位数: {med(confs)}    时长中位数: {med(durations)}s")
+print("Top1 物种:")
+for name, count in species.most_common(10):
+    print(f"  {count:4d}  {name}")
+EOF
+}
+
+cmd_log() { tail -n 100 logs/api.log 2>/dev/null || { screen -S "$SESSION" -X hardcopy /tmp/bird_screen.log 2>/dev/null || true; tail -n 100 /tmp/bird_screen.log 2>/dev/null; } || echo "无日志"; }
+cmd_audio_log() { tail -n 100 logs/audio.log 2>/dev/null || { screen -S "$AUDIO_SESSION" -X hardcopy /tmp/bird_audio_screen.log 2>/dev/null || true; tail -n 100 /tmp/bird_audio_screen.log 2>/dev/null; } || echo "无日志"; }
+
+case "${1:-}" in
+  restart) cmd_restart "${2:-all}" ;;
+  start)   ready || start_image; audio_ready || start_audio ;;
+  stop)    kill_service "$SESSION" "uvicorn api.bird_frames_service:app"
+           kill_service "$AUDIO_SESSION" "uvicorn api.bird_audio_service:app"; echo "已停止" ;;
+  status)  cmd_status ;;
+  submit)  shift; cmd_submit "$@" ;;
+  result)  shift; cmd_result "$@" ;;
+  audio-submit) shift; cmd_audio_submit "$@" ;;
+  audio)   shift; cmd_audio "$@" ;;
+  stats)   shift; cmd_stats "$@" ;;
+  log)     cmd_log ;;
+  audio-log) cmd_audio_log ;;
+  *) cat <<EOF
+用法: ./birdctl <命令>      图片识别与音频识别是两个独立服务
+
+图片识别（$BASE）
+  submit <图片URL> [图2] [图3]   提交图片识别任务
+  result <requestId>             等待并打印图片识别结果
+
+音频识别（$AUDIO_BASE，与图片完全独立）
+  audio-submit <音频URL>         提交音频识别，直接返回声学结果
+  audio [on|off]                 启动/停止音频服务；不带参数看状态
+
+服务
+  restart [image|audio|all]      重启服务（默认全部）
+  start | stop                   启动 / 停止全部
+  status                         两个服务的进程与健康状态
+  stats [天数]                   汇总音频识别历史（状态/噪音/Top1 物种）
+  log | audio-log                最近日志
+
+示例:
+  ./birdctl submit https://cdn.example.com/evt/f0.jpg
+  ./birdctl audio-submit https://cdn.example.com/evt/a.wav
+EOF
+    ;;
+esac

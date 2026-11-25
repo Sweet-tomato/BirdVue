@@ -1,0 +1,10 @@
+{
+  "version": "region-priors-v1",
+  "description": "Soft priors only. Empty GLOBAL leaves BioCLIP scores unchanged.",
+  "regions": {
+    "GLOBAL": {
+      "description": "No geographic adjustment",
+      "species": {}
+    }
+  }
+}
