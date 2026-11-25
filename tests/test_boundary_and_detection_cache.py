@@ -45,6 +45,20 @@ class BoundarySecurityTest(unittest.TestCase):
         self.assertEqual(ctx.exception.detail, "private_image_host_not_allowed")
 
 
+class ModelConcurrencyTest(unittest.TestCase):
+    def test_encode_semaphore_allows_configured_concurrency(self):
+        self.assertGreaterEqual(bird_cli.MODEL_CONCURRENCY, 1)
+        held = []
+        try:
+            for _ in range(bird_cli.MODEL_CONCURRENCY):
+                self.assertTrue(bird_cli._MODEL_SEMAPHORE.acquire(blocking=False))
+                held.append(True)
+            self.assertFalse(bird_cli._MODEL_SEMAPHORE.acquire(blocking=False))
+        finally:
+            for _ in held:
+                bird_cli._MODEL_SEMAPHORE.release()
+
+
 class DetectionCacheTest(unittest.TestCase):
     def test_detect_frame_scores_returns_reusable_focus(self):
         from PIL import Image

@@ -841,7 +841,7 @@ async def create_job_async(
             "resultUrl": f"/v1/results/{request_id}", "pollAfterMs": 2000}
 
 
-_LONGPOLL_SECONDS = float(os.getenv("BIRD_RESULT_LONGPOLL_SECONDS", "75"))
+_LONGPOLL_SECONDS = float(os.getenv("BIRD_RESULT_LONGPOLL_SECONDS", "15"))
 
 
 @app.get("/v1/results/{request_id}")
@@ -855,7 +855,8 @@ async def get_result(request: Request, request_id: str,
         log.info("result_fetch requestId=%s status=not_found bytes=0 waitMs=%d remote=%s",
                  request_id, int((time.time() - started) * 1000), remote)
         raise HTTPException(status_code=404, detail="job_not_found")
-    # 长轮询：未完成时挂起等待，兼容“提交后只轮询一次”的调用方。
+    # 短时轮询：未完成时等待一小段时间后返回当前状态；调用方按 pollAfterMs 继续轮询
+    # 或使用 callbackUrl 接收终态，避免单个请求长期占用连接。
     deadline = time.time() + _LONGPOLL_SECONDS
     while job["status"] not in ("done", "error") and time.time() < deadline:
         await asyncio.sleep(0.3)

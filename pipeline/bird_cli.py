@@ -49,7 +49,11 @@ BIOCLIP_PYTHON_PATH = str(ROOT)
 CROP_MODEL_PATH = ROOT.parent / "models" / "bird-crop-yolox-tiny.onnx"
 SUPPLEMENTAL_SPECIES_PATH = ROOT / "avilist_v2025b_supplemental_species.json"
 SUPPLEMENTAL_EMBEDDINGS_PATH = ROOT / "avilist_v2025b_supplemental_embeddings.npy"
+# 仅保护 cv2.dnn.Net 的 setInput/forward（不是线程安全的）；
+# BioCLIP 图像编码（torch / ONNX Runtime）可并发，改用信号量限制并发度。
 _MODEL_LOCK = threading.Lock()
+MODEL_CONCURRENCY = max(1, int(os.environ.get("BIRD_MODEL_CONCURRENCY", "4")))
+_MODEL_SEMAPHORE = threading.BoundedSemaphore(MODEL_CONCURRENCY)
 TOP_K = 5
 HEAD_RERANK_THRESHOLD = 0.5
 DETECTION_INPUT_SIZE = 416
@@ -390,8 +394,9 @@ def infer_birds(image, focus_net):
     canvas = np.full((DETECTION_INPUT_SIZE, DETECTION_INPUT_SIZE, 3), 114, dtype=np.uint8)
     canvas[:resized_height, :resized_width] = resized[:, :, ::-1]
     blob = cv2.dnn.blobFromImage(canvas, scalefactor=1.0, size=(DETECTION_INPUT_SIZE, DETECTION_INPUT_SIZE), swapRB=False, crop=False)
-    focus_net.setInput(blob)
-    rows = np.asarray(focus_net.forward()).reshape(-1, 85)
+    with _MODEL_LOCK:
+        focus_net.setInput(blob)
+        rows = np.asarray(focus_net.forward()).reshape(-1, 85)
 
     candidates = []
     index = 0
@@ -950,14 +955,13 @@ def encode_frame_embedding(image_path, torch, preprocess, model, focus_net,
     if cached:
         detected_focus, focus_meta = cached_focus, cached_meta
     else:
-        with _MODEL_LOCK:
-            detected_focus, focus_meta = create_focus_view(original, focus_net)
+        detected_focus, focus_meta = create_focus_view(original, focus_net)
     focus = detected_focus if use_crop else None
     views = [original] + ([focus] if focus is not None else [])
     tensor = torch.stack([preprocess(view) for view in views]).to(
         getattr(model, "_inference_device", "cpu")
     )
-    with _MODEL_LOCK, torch.inference_mode():
+    with _MODEL_SEMAPHORE, torch.inference_mode():
         features = torch.nn.functional.normalize(model.encode_image(tensor), dim=-1)
         if focus is not None:
             detection_score = float(focus_meta["score"] or 0)
@@ -985,8 +989,7 @@ def analyze_local(image_path, runtime, region=None, use_crop=True,
     if cached:
         detected_focus, focus_meta = cached_focus, cached_meta
     else:
-        with _MODEL_LOCK:
-            detected_focus, focus_meta = create_focus_view(original, focus_net)
+        detected_focus, focus_meta = create_focus_view(original, focus_net)
     focus = detected_focus if use_crop else None
     if not use_crop and detected_focus is not None:
         focus_meta = {**focus_meta, "focusUsed": False, "focusReason": "disabled_by_option"}
@@ -996,7 +999,7 @@ def analyze_local(image_path, runtime, region=None, use_crop=True,
     tensor = torch.stack([preprocess(view) for view in views]).to(
         getattr(model, "_inference_device", "cpu")
     )
-    with _MODEL_LOCK, torch.inference_mode():
+    with _MODEL_SEMAPHORE, torch.inference_mode():
         features = torch.nn.functional.normalize(model.encode_image(tensor), dim=-1)
         if focus is not None:
             detection_score = float(focus_meta["score"] or 0)
@@ -1127,7 +1130,7 @@ def analyze_local(image_path, runtime, region=None, use_crop=True,
         detail_tensor = torch.stack(
             [preprocess(item["image"]) for item in detail_views]
         ).to(getattr(model, "_inference_device", "cpu"))
-        with _MODEL_LOCK, torch.inference_mode():
+        with _MODEL_SEMAPHORE, torch.inference_mode():
             detail_embeddings = torch.nn.functional.normalize(
                 model.encode_image(detail_tensor), dim=-1
             ).cpu().numpy()
@@ -1632,8 +1635,7 @@ def detect_frame_scores(paths, runtime, include_focus=False):
         try:
             with Image.open(path) as image:
                 original = ImageOps.exif_transpose(image).convert("RGB")
-            with _MODEL_LOCK:
-                focus, focus_meta = create_focus_view(original, focus_net)
+            focus, focus_meta = create_focus_view(original, focus_net)
             box = (focus_meta or {}).get("box")
             score = (focus_meta or {}).get("score")
         except Exception:  # noqa: BLE001 - a bad frame must not kill the request

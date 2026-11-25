@@ -3,6 +3,21 @@
 > 历史迭代版本不再保留本地副本，完整代码与演进过程以本仓库 git 提交历史为准。
 > 追溯方式：`git log --oneline`、`git show <commit>`、`git log -p -- <path>`。
 
+## 2026-11-25 并发与轮询优化（分支 optimize/perf-security 续）
+
+背景：上一步去掉重复 YOLO 后，独占锁仍把所有 BioCLIP 编码串行化；结果查询默认长轮询 75 秒，高并发下占用连接。
+
+改动：
+
+- `pipeline/bird_cli.py`：`_MODEL_LOCK` 缩到只保护 `cv2.dnn.Net.setInput/forward`；BioCLIP 编码改用 `_MODEL_SEMAPHORE`，并发度由 `BIRD_MODEL_CONCURRENCY` 控制，默认 4。
+- `api/bird_frames_service.py`：`BIRD_RESULT_LONGPOLL_SECONDS` 默认 75 → 15，未完成即返回当前状态。
+- `config/service.env.example`：补充两个新参数。
+- `tests/test_boundary_and_detection_cache.py`：新增编码并发信号量回归测试。
+
+验证：80 个单测运行，新增用例全通过，剩余 11 个失败与基线一致（缺模型资产）。`python -m compileall -q api pipeline` 通过。
+
+风险：并发编码会提高 CPU 占用，核数少时把 `BIRD_MODEL_CONCURRENCY` 设为 1~2；长轮询缩短后“只轮询一次”的调用方需改为继续轮询或使用 `callbackUrl`。
+
 ## 2026-11-25 边界安全与重复检测优化（分支 optimize/perf-security）
 
 背景：公网 URL 校验后再次 DNS 解析存在 rebinding 风险；选帧与本地分析对同一帧重复跑 YOLO，且全局模型锁下重复推理进一步压低吞吐。
