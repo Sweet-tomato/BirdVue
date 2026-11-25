@@ -928,15 +928,30 @@ def local_identified_report(local_result):
     return report
 
 
-def encode_frame_embedding(image_path, torch, preprocess, model, focus_net, use_crop):
+def _cached_focus(image_path, frame_detections):
+    """取选帧阶段已算好的 focus，避免同一帧重复检测。"""
+    if not frame_detections:
+        return None, None, False
+    entry = frame_detections.get(str(Path(image_path).resolve()))
+    if not entry:
+        return None, None, False
+    return entry.get("focus"), entry.get("focusMeta"), True
+
+
+def encode_frame_embedding(image_path, torch, preprocess, model, focus_net,
+                           use_crop, frame_detections=None):
     """Encode one extra frame of the same event the same way the main frame is."""
 
     from PIL import Image, ImageOps
 
     with Image.open(image_path) as image:
         original = ImageOps.exif_transpose(image).convert("RGB")
-    with _MODEL_LOCK:
-        detected_focus, focus_meta = create_focus_view(original, focus_net)
+    cached_focus, cached_meta, cached = _cached_focus(image_path, frame_detections)
+    if cached:
+        detected_focus, focus_meta = cached_focus, cached_meta
+    else:
+        with _MODEL_LOCK:
+            detected_focus, focus_meta = create_focus_view(original, focus_net)
     focus = detected_focus if use_crop else None
     views = [original] + ([focus] if focus is not None else [])
     tensor = torch.stack([preprocess(view) for view in views]).to(
@@ -956,7 +971,8 @@ def encode_frame_embedding(image_path, torch, preprocess, model, focus_net, use_
     return feature.cpu().numpy(), focus_meta
 
 
-def analyze_local(image_path, runtime, region=None, use_crop=True, extra_frames=(), observation=None):
+def analyze_local(image_path, runtime, region=None, use_crop=True,
+                  extra_frames=(), observation=None, frame_detections=None):
     from PIL import Image, ImageOps
 
     torch, model, preprocess, head, logit_scale, classes, global_labels, common_names, global_text, focus_net = runtime
@@ -965,8 +981,12 @@ def analyze_local(image_path, runtime, region=None, use_crop=True, extra_frames=
     started = time.perf_counter()
     with Image.open(image_path) as image:
         original = ImageOps.exif_transpose(image).convert("RGB")
-    with _MODEL_LOCK:
-        detected_focus, focus_meta = create_focus_view(original, focus_net)
+    cached_focus, cached_meta, cached = _cached_focus(image_path, frame_detections)
+    if cached:
+        detected_focus, focus_meta = cached_focus, cached_meta
+    else:
+        with _MODEL_LOCK:
+            detected_focus, focus_meta = create_focus_view(original, focus_net)
     focus = detected_focus if use_crop else None
     if not use_crop and detected_focus is not None:
         focus_meta = {**focus_meta, "focusUsed": False, "focusReason": "disabled_by_option"}
@@ -1000,7 +1020,7 @@ def analyze_local(image_path, runtime, region=None, use_crop=True, extra_frames=
         if extra is None:
             continue
         extra_feature, extra_focus_meta = encode_frame_embedding(
-            extra, torch, preprocess, model, focus_net, use_crop
+            extra, torch, preprocess, model, focus_net, use_crop, frame_detections
         )
         frame_embeddings.append(extra_feature)
         frame_focus.append(extra_focus_meta)
@@ -1521,14 +1541,15 @@ def analyze_local(image_path, runtime, region=None, use_crop=True, extra_frames=
     return local_result, original, focus
 
 
-def prepare_local(image_path, runtime, region=None, use_crop=True, extra_frames=(), observation=None):
+def prepare_local(image_path, runtime, region=None, use_crop=True,
+                  extra_frames=(), observation=None, frame_detections=None):
     """Run the local BioCLIP chain only. The returned object is handed to
     review_prepared() later; Doubao review is the only async stage."""
     started = time.perf_counter()
     observation_kwargs = {"observation": observation} if observation is not None else {}
     local_result, original, focus = analyze_local(
         image_path, runtime, region=region, use_crop=use_crop, extra_frames=extra_frames,
-        **observation_kwargs,
+        frame_detections=frame_detections, **observation_kwargs,
     )
     config = runtime[1]._pipeline_config
     event_images = None
@@ -1588,12 +1609,16 @@ def _tight_crop(image, box, minimum_side=120, pad_ratio=0.18):
 EVENT_CROP_MIN_SCORE = 0.35
 
 
-def detect_frame_scores(paths, runtime):
+def detect_frame_scores(paths, runtime, include_focus=False):
     """Detect the bird in every frame of one event.
 
     Returns per-frame ``{index, name, box, score, area}``. Used to pick the main
     frame (a detector hit beats a merely sharp frame) and to judge whether a
     per-frame crop is trustworthy enough to send to the review model.
+
+    With ``include_focus=True`` the focus crop and its full metadata are also
+    returned so the local stage can reuse the detection instead of running
+    YOLO a second time on the same frame.
     """
     from PIL import Image, ImageOps
 
@@ -1602,27 +1627,33 @@ def detect_frame_scores(paths, runtime):
     for index, path in enumerate(paths):
         box = None
         score = None
+        focus = None
+        focus_meta = None
         try:
             with Image.open(path) as image:
                 original = ImageOps.exif_transpose(image).convert("RGB")
             with _MODEL_LOCK:
-                _, meta = create_focus_view(original, focus_net)
-            box = (meta or {}).get("box")
-            score = (meta or {}).get("score")
+                focus, focus_meta = create_focus_view(original, focus_net)
+            box = (focus_meta or {}).get("box")
+            score = (focus_meta or {}).get("score")
         except Exception:  # noqa: BLE001 - a bad frame must not kill the request
-            box, score = None, None
+            box, score, focus, focus_meta = None, None, None, None
         area = 0.0
         if box:
             area = max(0.0, float(box[2]) - float(box[0])) * max(
                 0.0, float(box[3]) - float(box[1])
             )
-        results.append({
+        item = {
             "index": index,
             "name": Path(path).name,
             "box": box,
             "score": float(score or 0.0),
             "area": area,
-        })
+        }
+        if include_focus:
+            item["focus"] = focus
+            item["focusMeta"] = focus_meta
+        results.append(item)
     return results
 
 
@@ -1723,12 +1754,13 @@ def finalize_decision(report, doubao_meta, local_result, decision_source):
     }
 
 
-def classify(image_path, runtime, region=None, use_crop=True, review_mode=None, extra_frames=(), observation=None):
+def classify(image_path, runtime, region=None, use_crop=True, review_mode=None,
+             extra_frames=(), observation=None, frame_detections=None):
     started = time.perf_counter()
     observation_kwargs = {"observation": observation} if observation is not None else {}
     local_result, original, focus = analyze_local(
         image_path, runtime, region=region, use_crop=use_crop, extra_frames=extra_frames,
-        **observation_kwargs,
+        frame_detections=frame_detections, **observation_kwargs,
     )
     config = runtime[1]._pipeline_config
     event_kwargs = {}

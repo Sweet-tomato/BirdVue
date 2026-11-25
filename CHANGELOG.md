@@ -3,6 +3,20 @@
 > 历史迭代版本不再保留本地副本，完整代码与演进过程以本仓库 git 提交历史为准。
 > 追溯方式：`git log --oneline`、`git show <commit>`、`git log -p -- <path>`。
 
+## 2026-11-25 边界安全与重复检测优化（分支 optimize/perf-security）
+
+背景：公网 URL 校验后再次 DNS 解析存在 rebinding 风险；选帧与本地分析对同一帧重复跑 YOLO，且全局模型锁下重复推理进一步压低吞吐。
+
+改动：
+
+- `api/_common.py`：鉴权改 `hmac.compare_digest`；新增 `resolve_public_ip()` 与 `build_public_opener()`，校验后固定 IP 建连，禁用代理与重定向，Host/SNI 仍用原域名。
+- `api/bird_frames_service.py`、`api/bird_audio_service.py`：图片/音频下载与公网回调改用固定 IP opener；选帧阶段返回逐帧 focus 缓存。
+- `pipeline/bird_cli.py`：`detect_frame_scores(include_focus=True)` 返回 focus 与完整元数据；`_cached_focus()` 让 `analyze_local`/`encode_frame_embedding`/`prepare_local`/`classify` 复用检测结果，同一帧不再跑两遍 YOLO。
+
+验证：新增 `tests/test_boundary_and_detection_cache.py` 4 个用例；79 个单测中新增用例全通过，剩余 11 个失败与基线完全一致（缺地理网格/AviList 注册表等模型资产）。`python -m compileall -q api pipeline` 通过。
+
+风险：图片/音频下载不再跟随 3xx；依赖重定向的图片 URL 需改直链。
+
 ## 2026-11-25 地理硬过滤下的开放提案（撤销 fe81654 的禁用）
 
 背景：硬过滤后豆包既看不到坐标、也不允许提案，本地池没有真鸟（迷鸟、屏幕/远程直播画面）时无法救回。要求豆包能看到经纬度、保留开放提案能力。
