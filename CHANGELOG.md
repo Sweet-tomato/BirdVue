@@ -12,6 +12,7 @@
 - `api/bird_frames_service.py`：请求头回显增加敏感词过滤（key/token/secret/auth/credential/session/signature），调用方凭证不再随结果回传并落盘；`reap_stale` 挂入每小时 retention 循环，worker 中途崩溃的 job 会被标记为 error 而非永远卡住。
 - `pipeline/audio_cli.py`：YAMNet 噪声门加载失败时输出 warning，不再静默降级。
 - `tests/`：需要模型资产的用例（AviList registry、地理网格）加 `skipUnless` 守卫；新增 `.github/workflows/tests.yml` CI。
+- 评审跟进：`reap_stale` 改走 `run_in_threadpool`（sqlite/redis 同步 I/O）；YOLOX 解码抽为 `_decode_yolox` 并修正 NaN 语义（`np.fmax/fmin`、`~(scores < threshold)` 与原 Python `max/min`、`score < threshold` 逐位一致）；新增 `tests/test_yolox_decode.py` 新旧解码等价回归（含 NaN/inf）与 `tests/test_header_filter.py`；`service.env.example` 补 `DOUBAO_TIMEOUT_SECONDS`/`DOUBAO_MAX_ATTEMPTS`/`BIRD_FIELDS_ASSET`。
 
 验证：`pytest tests/` 69 passed / 11 skipped（缺模型资产的用例按预期跳过），`py_compile` 通过。
 

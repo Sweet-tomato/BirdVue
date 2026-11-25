@@ -382,6 +382,46 @@ def positions(full, tile, overlap_ratio):
     return values
 
 
+def _decode_yolox(rows, width, height, scale):
+    """Decode raw YOLOX rows into pre-NMS candidates (vectorized).
+
+    Bit-equivalent to the original per-cell loop: scores multiply in float32
+    then widen to float64; coords compute in float64; ``np.fmax``/``np.fmin``
+    and ``~(scores < threshold)`` reproduce Python ``max``/``min`` and the
+    ``score < threshold`` skip, including their NaN behavior.
+    """
+    candidates = []
+    offset = 0
+    for stride in (8, 16, 32):
+        size = DETECTION_INPUT_SIZE // stride
+        count = size * size
+        block32 = rows[offset:offset + count]
+        offset += count
+        scores = (block32[:, 4] * block32[:, 5 + BIRD_CLASS_ID]).astype(np.float64)
+        # 原实现 `if score < THRESHOLD: continue` 对 NaN 不跳过，保持一致。
+        keep = np.nonzero(~(scores < DETECTION_THRESHOLD))[0]
+        if keep.size == 0:
+            continue
+        grid_y, grid_x = np.indices((size, size))
+        grid_y = grid_y.reshape(-1)[keep]
+        grid_x = grid_x.reshape(-1)[keep]
+        block = block32[keep].astype(np.float64)
+        center_x = (block[:, 0] + grid_x) * stride
+        center_y = (block[:, 1] + grid_y) * stride
+        box_width = np.exp(np.clip(block[:, 2], -20, 20)) * stride
+        box_height = np.exp(np.clip(block[:, 3], -20, 20)) * stride
+        x1 = np.fmax(0.0, (center_x - box_width / 2) / scale)
+        y1 = np.fmax(0.0, (center_y - box_height / 2) / scale)
+        x2 = np.fmin(float(width), (center_x + box_width / 2) / scale)
+        y2 = np.fmin(float(height), (center_y + box_height / 2) / scale)
+        for i in range(keep.size):
+            candidates.append({
+                "score": float(scores[keep[i]]),
+                "box": [float(x1[i]), float(y1[i]), float(x2[i]), float(y2[i])],
+            })
+    return candidates
+
+
 def infer_birds(image, focus_net):
     import cv2
 
@@ -398,36 +438,7 @@ def infer_birds(image, focus_net):
         focus_net.setInput(blob)
         rows = np.asarray(focus_net.forward()).reshape(-1, 85)
 
-    candidates = []
-    offset = 0
-    for stride in (8, 16, 32):
-        size = DETECTION_INPUT_SIZE // stride
-        count = size * size
-        block32 = rows[offset:offset + count]
-        offset += count
-        # 分数保持 float32 相乘再转 float64，与原逐行实现逐位一致；
-        # 坐标计算用 float64，等价于原 float(row[i]) 的精度。
-        scores = (block32[:, 4] * block32[:, 5 + BIRD_CLASS_ID]).astype(np.float64)
-        keep = np.nonzero(scores >= DETECTION_THRESHOLD)[0]
-        if keep.size == 0:
-            continue
-        grid_y, grid_x = np.indices((size, size))
-        grid_y = grid_y.reshape(-1)[keep]
-        grid_x = grid_x.reshape(-1)[keep]
-        block = block32[keep].astype(np.float64)
-        center_x = (block[:, 0] + grid_x) * stride
-        center_y = (block[:, 1] + grid_y) * stride
-        box_width = np.exp(np.clip(block[:, 2], -20, 20)) * stride
-        box_height = np.exp(np.clip(block[:, 3], -20, 20)) * stride
-        x1 = np.maximum(0.0, (center_x - box_width / 2) / scale)
-        y1 = np.maximum(0.0, (center_y - box_height / 2) / scale)
-        x2 = np.minimum(float(width), (center_x + box_width / 2) / scale)
-        y2 = np.minimum(float(height), (center_y + box_height / 2) / scale)
-        for i in range(keep.size):
-            candidates.append({
-                "score": float(scores[keep[i]]),
-                "box": [float(x1[i]), float(y1[i]), float(x2[i]), float(y2[i])],
-            })
+    candidates = _decode_yolox(rows, width, height, scale)
 
     kept = []
     for candidate in sorted(candidates, key=lambda item: item["score"], reverse=True):
