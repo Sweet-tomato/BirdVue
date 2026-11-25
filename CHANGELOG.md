@@ -3,6 +3,18 @@
 > 历史迭代版本不再保留本地副本，完整代码与演进过程以本仓库 git 提交历史为准。
 > 追溯方式：`git log --oneline`、`git show <commit>`、`git log -p -- <path>`。
 
+## 2026-11-25 性能与健壮性收尾（分支 optimize/perf-security 续）
+
+改动：
+
+- `pipeline/bird_cli.py`：`infer_birds` 的 YOLOX 输出解码由逐行 Python 循环改为 numpy 向量化（分数 float32 相乘、坐标 float64，与原实现逐位一致），NMS 保持不变。
+- `pipeline/doubao_report.py`：豆包调用对 5xx/超时/网络错误重试一次（`DOUBAO_MAX_ATTEMPTS`，默认 2），超时改读 `review.timeoutSeconds` 配置或 `DOUBAO_TIMEOUT_SECONDS`，不再硬编码 120s；`_FIELDS_ASSET_PATH` 去掉 `/root/bird_service` 硬编码，默认按仓库相对路径解析，可用 `BIRD_FIELDS_ASSET` 覆盖。
+- `api/bird_frames_service.py`：请求头回显增加敏感词过滤（key/token/secret/auth/credential/session/signature），调用方凭证不再随结果回传并落盘；`reap_stale` 挂入每小时 retention 循环，worker 中途崩溃的 job 会被标记为 error 而非永远卡住。
+- `pipeline/audio_cli.py`：YAMNet 噪声门加载失败时输出 warning，不再静默降级。
+- `tests/`：需要模型资产的用例（AviList registry、地理网格）加 `skipUnless` 守卫；新增 `.github/workflows/tests.yml` CI。
+
+验证：`pytest tests/` 69 passed / 11 skipped（缺模型资产的用例按预期跳过），`py_compile` 通过。
+
 ## 2026-11-25 并发与轮询优化（分支 optimize/perf-security 续）
 
 背景：上一步去掉重复 YOLO 后，独占锁仍把所有 BioCLIP 编码串行化；结果查询默认长轮询 75 秒，高并发下占用连接。

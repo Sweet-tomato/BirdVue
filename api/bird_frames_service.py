@@ -18,6 +18,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import sys
@@ -91,6 +92,14 @@ RESULT_FIELD_ORDER.insert(RESULT_FIELD_ORDER.index("confidence"), "bestImageInde
 
 # 回显请求头时必须剔除鉴权类字段，避免把 API Key 原样返回给调用方。
 HEADER_IGNORE = {"authorization", "cookie", "proxy-authorization"}
+# 头名按分隔符拆词后命中这些词的也视为敏感（x-api-key、x-auth-token 等），
+# 否则调用方自带的凭证会随结果回传并写进 request.json/result.json。
+HEADER_SENSITIVE_TOKENS = {"key", "token", "secret", "auth", "credential", "session", "signature"}
+
+
+def _sensitive_header(name: str) -> bool:
+    parts = {part for part in re.split(r"[^a-z0-9]+", name.lower()) if part}
+    return bool(parts & HEADER_SENSITIVE_TOKENS)
 
 
 def _order_result(report: dict[str, Any], best_index: int = 0) -> dict[str, Any]:
@@ -183,9 +192,9 @@ def _submit_meta(payload: list[str] | JobSubmit) -> dict[str, Any]:
 
 
 def _header_meta(request: Request) -> dict[str, str]:
-    """原样回显调用方请求头，剔除鉴权类字段。"""
+    """回显调用方请求头，剔除鉴权/凭证类字段。"""
     return {key: value for key, value in request.headers.items()
-            if key.lower() not in HEADER_IGNORE}
+            if key.lower() not in HEADER_IGNORE and not _sensitive_header(key)}
 
 
 def _attach_submit(result: dict[str, Any], meta: dict[str, Any],
@@ -415,9 +424,16 @@ def _prune_expired_requests() -> None:
         log.info("retention_pruned days=%d retentionDays=%d", removed, RETENTION_DAYS)
 
 
-async def _retention_loop() -> None:
+async def _retention_loop(app: FastAPI) -> None:
     while True:
         await run_in_threadpool(_prune_expired_requests)
+        # 周期回收：worker 中途崩溃的 job 会永远卡在非终态，reap 成显式 error。
+        try:
+            reaped = app.state.jobs.reap_stale(JOB_TTL_SECONDS)
+            if reaped:
+                log.warning("stale_jobs_reaped count=%d ttlSeconds=%d", reaped, JOB_TTL_SECONDS)
+        except Exception as error:  # noqa: BLE001
+            log.warning("reap_stale_failed error=%s", error)
         await asyncio.sleep(3600)
 
 
@@ -603,7 +619,7 @@ async def lifespan(app: FastAPI):
     app.state.ready = True
     for _ in range(max(1, QUEUE_WORKERS)):
         app.state.worker_tasks.append(asyncio.create_task(_worker(app)))
-    app.state.retention_task = asyncio.create_task(_retention_loop())
+    app.state.retention_task = asyncio.create_task(_retention_loop(app))
     log.info("service_ready workers=%d persist=%s retentionDays=%d logDir=%s",
              max(1, QUEUE_WORKERS), PERSIST_ENABLED, RETENTION_DAYS, LOG_DIR)
     yield

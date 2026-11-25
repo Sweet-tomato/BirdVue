@@ -13,6 +13,10 @@ CONFIG = json.loads((REPO / "config" / "pipeline_config.json").read_text(encodin
 SETTINGS = dict(CONFIG.get("geographicPrior") or {})
 ROOT = REPO / "config"
 TAXONOMY = (CONFIG.get("taxonomy") or {}).get("version")
+GEO_ASSET = REPO / "models" / "geographic" / "species_support_grid.json"
+needs_geo_asset = unittest.skipUnless(
+    GEO_ASSET.is_file(), "geographic grid asset not present (models/ is not in the repo)"
+)
 
 
 def observation(lat, lon):
@@ -42,6 +46,7 @@ class GeographicFilterTests(unittest.TestCase):
         self.assertIsNone(ids)
         self.assertEqual(status["reason"], "missing_or_invalid_wgs84_location")
 
+    @needs_geo_asset
     def test_outside_coverage_is_neutral(self):
         ids, status = geographic_prior.allowed_species(
             SETTINGS, observation(0.0, 0.0), root=ROOT, taxonomy_version=TAXONOMY
@@ -49,6 +54,7 @@ class GeographicFilterTests(unittest.TestCase):
         self.assertIsNone(ids)
         self.assertEqual(status["reason"], "outside_coverage")
 
+    @needs_geo_asset
     def test_beijing_cell_returns_local_pool(self):
         ids, status = geographic_prior.allowed_species(
             SETTINGS, observation(39.9042, 116.4074), root=ROOT, taxonomy_version=TAXONOMY
@@ -60,6 +66,7 @@ class GeographicFilterTests(unittest.TestCase):
         self.assertGreaterEqual(len(ids), int(SETTINGS.get("minPoolSpecies", 20)))
         self.assertIn("avibase-", next(iter(ids)))
 
+    @needs_geo_asset
     def test_pool_too_small_is_neutral(self):
         settings = dict(SETTINGS, minPoolSpecies=100000)
         ids, status = geographic_prior.allowed_species(

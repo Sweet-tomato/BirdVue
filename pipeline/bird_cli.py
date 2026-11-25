@@ -399,29 +399,35 @@ def infer_birds(image, focus_net):
         rows = np.asarray(focus_net.forward()).reshape(-1, 85)
 
     candidates = []
-    index = 0
+    offset = 0
     for stride in (8, 16, 32):
         size = DETECTION_INPUT_SIZE // stride
-        for grid_y in range(size):
-            for grid_x in range(size):
-                row = rows[index]
-                index += 1
-                score = float(row[4] * row[5 + BIRD_CLASS_ID])
-                if score < DETECTION_THRESHOLD:
-                    continue
-                center_x = (float(row[0]) + grid_x) * stride
-                center_y = (float(row[1]) + grid_y) * stride
-                box_width = np.exp(np.clip(float(row[2]), -20, 20)) * stride
-                box_height = np.exp(np.clip(float(row[3]), -20, 20)) * stride
-                candidates.append({
-                    "score": score,
-                    "box": [
-                        max(0.0, (center_x - box_width / 2) / scale),
-                        max(0.0, (center_y - box_height / 2) / scale),
-                        min(float(width), (center_x + box_width / 2) / scale),
-                        min(float(height), (center_y + box_height / 2) / scale),
-                    ],
-                })
+        count = size * size
+        block32 = rows[offset:offset + count]
+        offset += count
+        # 分数保持 float32 相乘再转 float64，与原逐行实现逐位一致；
+        # 坐标计算用 float64，等价于原 float(row[i]) 的精度。
+        scores = (block32[:, 4] * block32[:, 5 + BIRD_CLASS_ID]).astype(np.float64)
+        keep = np.nonzero(scores >= DETECTION_THRESHOLD)[0]
+        if keep.size == 0:
+            continue
+        grid_y, grid_x = np.indices((size, size))
+        grid_y = grid_y.reshape(-1)[keep]
+        grid_x = grid_x.reshape(-1)[keep]
+        block = block32[keep].astype(np.float64)
+        center_x = (block[:, 0] + grid_x) * stride
+        center_y = (block[:, 1] + grid_y) * stride
+        box_width = np.exp(np.clip(block[:, 2], -20, 20)) * stride
+        box_height = np.exp(np.clip(block[:, 3], -20, 20)) * stride
+        x1 = np.maximum(0.0, (center_x - box_width / 2) / scale)
+        y1 = np.maximum(0.0, (center_y - box_height / 2) / scale)
+        x2 = np.minimum(float(width), (center_x + box_width / 2) / scale)
+        y2 = np.minimum(float(height), (center_y + box_height / 2) / scale)
+        for i in range(keep.size):
+            candidates.append({
+                "score": float(scores[keep[i]]),
+                "box": [float(x1[i]), float(y1[i]), float(x2[i]), float(y2[i])],
+            })
 
     kept = []
     for candidate in sorted(candidates, key=lambda item: item["score"], reverse=True):
@@ -1516,6 +1522,7 @@ def analyze_local(image_path, runtime, region=None, use_crop=True,
             "reviewForceCandidate": bool(config["review"].get("forceCandidate", False)),
             "reviewForceAllowsUnknown": bool(config["review"].get("forceAllowsUnknown", False)),
             "reviewMaxCandidates": review_max_candidates,
+            "reviewTimeoutSeconds": config["review"].get("timeoutSeconds"),
             "identificationCards": resolve_card_settings(config),
             "knowledgeGraph": resolve_knowledge_graph_settings(config),
             "openSetEscape": open_set_config,
