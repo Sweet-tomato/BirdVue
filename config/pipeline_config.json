@@ -1,0 +1,125 @@
+{
+  "version": "bird-pipeline-v2.5-service-1",
+  "model": {
+    "name": "BioCLIP 2.5",
+    "architecture": "ViT-H-14",
+    "embeddingDimension": 1024,
+    "device": "cpu",
+    "assetManifestFile": "../models/bioclip25/birds/asset_manifest.json",
+    "openClipPythonPath": "..",
+    "cropModelFile": "../models/bird-crop-yolox-tiny.onnx"
+  },
+  "taxonomy": {
+    "version": "AviList-v2025b"
+  },
+  "localDecision": {
+    "minimumDetectionScore": 0.1,
+    "marginThreshold": 0.05,
+    "requireViewAgreement": true,
+    "maximumClippedEdges": 1,
+    "targetPrecision": 0.95,
+    "calibration": {
+      "status": "margin_threshold_from_20261121_batch",
+      "targetPrecision": 0.95,
+      "note": "margin(top1-top2) threshold 0.05 from 293-event batch: correct p50=0.093, wrong p50=0.048. Quality-score gate removed (no discriminative power: 39/63 wrong cases scored >=80). Raw similarity threshold not used (wrong-case median 0.501 overlaps correct-case distribution)."
+    }
+  },
+  "region": {
+    "default": "OFF",
+    "mode": "soft",
+    "maxBonus": 0.02,
+    "priorsFile": "region_priors.json"
+  },
+  "geographicPrior": {
+    "enabled": true,
+    "filterMode": "hard",
+    "minPoolSpecies": 20,
+    "maxBonus": 0.0,
+    "dataFile": "../models/geographic/species_support_grid.json",
+    "expectedSha256": "b395b381fcf17fa77c9ce1facfad767607fd91e35f0c90565d5807127b841602",
+    "note": "Hard local-species filter (2026-11-25): when the device supplies a valid WGS84 location inside coverage (China + North America, 473 cells, eBird/GBIF-derived), BioCLIP similarity for species without support in the containing 3-degree cell is suppressed, so Top5 only ranks the local avifauna. Outside coverage, missing location, or pool < minPoolSpecies falls back to the full taxonomy (neutral). Only valid when the photographed bird is physically at the device location; screen/remote-stream imagery must not send location."
+  },
+  "review": {
+    "defaultMode": "auto",
+    "timeoutSeconds": 120,
+    "minimumSupportingFeatures": 3,
+    "maxCandidates": 5,
+    "forceCandidate": true,
+    "forceAllowsUnknown": true
+  },
+  "supplementalCandidates": {
+    "catalog": "AviList-v2025b-missing-640",
+    "embeddingMethod": "normalize_each_prompt_then_mean_then_normalize",
+    "mergeMode": "unified_score_topk",
+    "blockOnCrossFamilyConflict": false,
+    "gateStatus": "unified_unvalidated",
+    "autoRoutingEnabled": false,
+    "useDuringExistingOrForcedReview": true
+  },
+  "imagePrototypeGallery": {
+    "enabled": false,
+    "optional": true,
+    "mode": "off",
+    "note": "Disabled for deployment."
+  },
+  "identificationCards": {
+    "mode": "off",
+    "allowUnreviewedSourceExcerpts": false,
+    "note": "Disabled for deployment."
+  },
+  "knowledgeGraph": {
+    "mode": "off",
+    "note": "Disabled for deployment."
+  },
+  "openSetEscape": {
+    "enabled": true,
+    "confirmationMode": "single_pass_shortlist",
+    "maximumBioCLIPRank": 50,
+    "singlePassMaximumInjectedCandidates": 1,
+    "allowConfidentProposal": true,
+    "proposalMinimumVisibleFeatures": 2,
+    "proposalMinimumQuality": 50,
+    "proposalConfidenceCap": 0.5,
+    "proposalOverrideCandidate": true,
+    "proposalOverrideMinEvidence": 3,
+    "proposalOverrideConfidenceCap": 0.4,
+    "proposalGeoBypassMinEvidence": 3,
+    "note": "Single call per event. When the review model is confident and the visible evidence contradicts every supplied candidate, it may name one species outside the shortlist (outsideCandidates); the program resolves that name against AviList and only then returns it, with confidence capped at proposalConfidenceCap. With proposalOverrideCandidate the proposal may also replace a first-pass candidate when it names that candidate's rank as contradicted, carries at least proposalOverrideMinEvidence visible evidence, and shares the candidate's family; confidence is then capped at proposalOverrideConfidenceCap. When the hard geographic filter restricted the candidate pool, the model still sees the device coordinates and may bypass the filter with a non-local species if it provides at least proposalGeoBypassMinEvidence visible evidence; the decision is audited as geoFilterBypassed. Candidate-pool escapes and API contract are otherwise unchanged."
+  },
+  "experimentalClassifierHead": {
+    "enabled": false,
+    "decisionRole": "disabled"
+  },
+  "multiFrame": {
+    "candidateFusion": "score_mean",
+    "sendAllFramesToVlm": true,
+    "note": "Three consecutive frames of one camera event; candidates fused by score_mean, all three images sent to Doubao."
+  },
+  "audio": {
+    "enabled": true,
+    "modelFile": "../models/birdnet/BirdNET_GLOBAL_6K_V2.4_Model_FP16.tflite",
+    "labelsFile": "../models/birdnet/BirdNET_GLOBAL_6K_V2.4_Model_FP16_Labels.txt",
+    "noiseModelFile": "../models/yamnet/yamnet.tflite",
+    "noiseClassMapFile": "../models/yamnet/yamnet_class_map.csv",
+    "noiseLabelsFile": "audio_noise_labels.json",
+    "taxonomyFile": "../models/bioclip25/birds/avilist_v2025b_species.json",
+    "sampleRate": 48000,
+    "noiseSampleRate": 16000,
+    "chunkSeconds": 3.0,
+    "hopSeconds": 1.5,
+    "maxSeconds": 60,
+    "minBirdScore": 0.1,
+    "noiseMargin": 1.2,
+    "minSnrDb": 3.0,
+    "noiseGateScore": 0.35,
+    "topK": 5,
+    "sensitivity": 1.0,
+    "numThreads": 2,
+    "note": "Standalone audio service (api/bird_audio_service.py, port 8001). Image pipeline does not read audio. Noise gate uses YAMNet (human/pet/vehicle/wind/media) plus spectral checks."
+  },
+  "textOverrides": {
+    "enabled": true,
+    "manifestFile": "../models/bioclip25/birds/text_overrides/common_birds_trait_v5.json",
+    "note": "v5 Tier A/B/C/D text overrides; review traits only, retrieval geometry unchanged."
+  }
+}

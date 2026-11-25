@@ -1,0 +1,13 @@
+fastapi>=0.115,<1
+uvicorn[standard]>=0.34,<1
+python-multipart>=0.0.20,<1
+open_clip_torch==3.3.0
+timm>=1.0.17,<2
+safetensors>=0.4,<1
+numpy>=1.26,<3
+Pillow>=10,<13
+opencv-python-headless>=4.10,<5
+onnxruntime>=1.20,<2
+soundfile>=0.12,<1
+scipy>=1.11,<2
+ai-edge-litert>=1.0,<2
