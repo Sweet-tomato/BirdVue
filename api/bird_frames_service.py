@@ -18,6 +18,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import shutil
 import socket
 import sys
@@ -41,7 +42,12 @@ SERVICE_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SERVICE_ROOT / "pipeline"))
 
 import bird_cli  # noqa: E402
-from api._common import authorize as _common_authorize, assert_public_host as _common_assert_public_host, normalize_location as _common_normalize_location  # noqa: E402
+from api._common import (  # noqa: E402
+    authorize as _common_authorize,
+    assert_public_host as _common_assert_public_host,
+    build_public_opener as _common_build_public_opener,
+    normalize_location as _common_normalize_location,
+)
 from bioclip25_runtime import load_runtime as load_bundle_runtime, bundle_stats  # noqa: E402
 from doubao_report import REQUIRED_FIELDS as BUSINESS_FIELDS  # noqa: E402
 from state_store import build_store  # noqa: E402
@@ -87,6 +93,14 @@ RESULT_FIELD_ORDER.insert(RESULT_FIELD_ORDER.index("confidence"), "bestImageInde
 
 # 回显请求头时必须剔除鉴权类字段，避免把 API Key 原样返回给调用方。
 HEADER_IGNORE = {"authorization", "cookie", "proxy-authorization"}
+# 头名按分隔符拆词后命中这些词的也视为敏感（x-api-key、x-auth-token 等），
+# 否则调用方自带的凭证会随结果回传并写进 request.json/result.json。
+HEADER_SENSITIVE_TOKENS = {"key", "token", "secret", "auth", "credential", "session", "signature"}
+
+
+def _sensitive_header(name: str) -> bool:
+    parts = {part for part in re.split(r"[^a-z0-9]+", name.lower()) if part}
+    return bool(parts & HEADER_SENSITIVE_TOKENS)
 
 
 def _order_result(report: dict[str, Any], best_index: int = 0) -> dict[str, Any]:
@@ -179,9 +193,9 @@ def _submit_meta(payload: list[str] | JobSubmit) -> dict[str, Any]:
 
 
 def _header_meta(request: Request) -> dict[str, str]:
-    """原样回显调用方请求头，剔除鉴权类字段。"""
+    """回显调用方请求头，剔除鉴权/凭证类字段。"""
     return {key: value for key, value in request.headers.items()
-            if key.lower() not in HEADER_IGNORE}
+            if key.lower() not in HEADER_IGNORE and not _sensitive_header(key)}
 
 
 def _attach_submit(result: dict[str, Any], meta: dict[str, Any],
@@ -215,16 +229,18 @@ def _frame_sharpness(path: Path) -> float:
 
 
 def _select_best_frame(paths: list[Path], request_id: str,
-                       runtime: Any | None = None) -> tuple[int, list[Path]]:
+                       runtime: Any | None = None) -> tuple[int, list[Path], dict[str, Any]]:
     """选主帧：检出鸟的帧优先（检测分、检出面积），全部未检出时退回清晰度。
 
     仅按清晰度选帧会被纹理丰富的空镜/屏幕画面骗到，把没有鸟的帧当作主帧，
     后面检测失败会连带压低质量分、走错提示词模式。
+
+    同时返回逐帧检测缓存，供本地阶段复用，避免同一帧重复跑 YOLO。
     """
     detection: list[dict[str, Any]] = []
     if runtime is not None:
         try:
-            detection = bird_cli.detect_frame_scores(paths, runtime)
+            detection = bird_cli.detect_frame_scores(paths, runtime, include_focus=True)
         except Exception as error:  # noqa: BLE001 - 检测失败退回清晰度
             log.warning("best_frame_detect_failed requestId=%s error=%s", request_id, error)
             detection = []
@@ -241,19 +257,31 @@ def _select_best_frame(paths: list[Path], request_id: str,
         best_index = max(range(len(sharpness)), key=lambda index: sharpness[index]) if sharpness else 0
         reason = "sharpness"
     ordered = [paths[best_index], *[path for index, path in enumerate(paths) if index != best_index]]
+    detection_cache: dict[str, Any] = {}
+    for item in detection:
+        index = int(item.get("index") or 0)
+        # focusMeta 为 None 说明该帧检测抛过异常；不缓存，让本地阶段走原路重算，
+        # 否则 analyze_local 会拿到 focus_meta=None 直接 AttributeError。
+        if 0 <= index < len(paths) and item.get("focusMeta") is not None:
+            detection_cache[str(paths[index].resolve())] = {
+                "focus": item.get("focus"),
+                "focusMeta": item.get("focusMeta"),
+            }
     log.info("best_frame requestId=%s reason=%s detection=%s sharpness=%s bestIndex=%d order=%s",
              request_id, reason,
              [{"i": item.get("index"), "score": round(float(item.get("score") or 0), 4),
                "area": int(item.get("area") or 0)} for item in detection],
              sharpness, best_index, [path.name for path in ordered])
-    return best_index, ordered
+    return best_index, ordered, detection_cache
 
 
 def _run_frames(runtime, paths: list[Path],
-                observation: dict[str, Any] | None = None) -> dict[str, Any]:
+                observation: dict[str, Any] | None = None,
+                frame_detections: dict[str, Any] | None = None) -> dict[str, Any]:
     return bird_cli.classify(
         paths[0], runtime, review_mode="on" if REVIEW_ENABLED else "off",
-        extra_frames=tuple(paths[1:]), observation=observation
+        extra_frames=tuple(paths[1:]), observation=observation,
+        frame_detections=frame_detections,
     )
 
 
@@ -397,9 +425,18 @@ def _prune_expired_requests() -> None:
         log.info("retention_pruned days=%d retentionDays=%d", removed, RETENTION_DAYS)
 
 
-async def _retention_loop() -> None:
+async def _retention_loop(app: FastAPI) -> None:
     while True:
         await run_in_threadpool(_prune_expired_requests)
+        # 周期回收：worker 中途崩溃的 job 会永远卡在非终态，reap 成显式 error。
+        # sqlite/redis 后端是同步 I/O，必须走线程池避免阻塞事件循环。
+        try:
+            reaped = await run_in_threadpool(
+                app.state.jobs.reap_stale, JOB_TTL_SECONDS)
+            if reaped:
+                log.warning("stale_jobs_reaped count=%d ttlSeconds=%d", reaped, JOB_TTL_SECONDS)
+        except Exception as error:  # noqa: BLE001
+            log.warning("reap_stale_failed error=%s", error)
         await asyncio.sleep(3600)
 
 
@@ -449,12 +486,12 @@ def _assert_public_host(url: str) -> None:
 
 
 def _download_image(url: str, directory: Path, index: int) -> Path:
-    """下载单帧：10MB 流式上限 + PIL 格式探测（JPEG/PNG/WebP）+ verify 后落盘。"""
-    _assert_public_host(url)
+    """下载单帧：公网 IP 固定 + 10MB 流式上限 + PIL 格式探测 + verify 后落盘。"""
     tmp = directory / f".dl{index}.part"
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "bird-service/1.0"})
-        with urllib.request.urlopen(request, timeout=30) as response, tmp.open("wb") as out:
+        opener = _common_build_public_opener(url, 'image', no_redirect=True)
+        with opener.open(request, timeout=30) as response, tmp.open("wb") as out:
             total = 0
             while True:
                 chunk = response.read(1024 * 1024)
@@ -514,7 +551,10 @@ def _resolve_callback_url(payload: list[str] | JobSubmit, request: Request) -> s
 def _post_callback(url: str, body: bytes, headers: dict[str, str]) -> int:
     """同步 POST 回调；非 2xx 抛出异常，由上层重试。"""
     request = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    opener = urllib.request.build_opener(_NoRedirect)
+    if CALLBACK_ALLOW_PRIVATE:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
+    else:
+        opener = _common_build_public_opener(url, 'callback', no_redirect=True)
     with opener.open(request, timeout=CALLBACK_TIMEOUT_SECONDS) as response:
         if response.status >= 300:
             raise RuntimeError(f"callback_http_{response.status}")
@@ -585,7 +625,7 @@ async def lifespan(app: FastAPI):
     app.state.ready = True
     for _ in range(max(1, QUEUE_WORKERS)):
         app.state.worker_tasks.append(asyncio.create_task(_worker(app)))
-    app.state.retention_task = asyncio.create_task(_retention_loop())
+    app.state.retention_task = asyncio.create_task(_retention_loop(app))
     log.info("service_ready workers=%d persist=%s retentionDays=%d logDir=%s",
              max(1, QUEUE_WORKERS), PERSIST_ENABLED, RETENTION_DAYS, LOG_DIR)
     yield
@@ -616,7 +656,9 @@ async def _worker(app: FastAPI):
                 for index, url in enumerate(job["imageUrls"])
             ]))
             job["paths"] = [str(p) for p in paths]
-            best_index, frames = _select_best_frame(paths, request_id, app.state.runtime)
+            # _select_best_frame 内含逐帧 ONNX 检测，必须走线程池，否则阻塞事件循环。
+            best_index, frames, frame_detections = await run_in_threadpool(
+                _select_best_frame, paths, request_id, app.state.runtime)
             job["bestImageIndex"] = best_index
             # 本地阶段（检测/裁剪/质量评估）放在后台执行，提交接口不再等待它。
             async with app.state.local_semaphore:
@@ -624,6 +666,7 @@ async def _worker(app: FastAPI):
                     bird_cli.prepare_local, frames[0], app.state.runtime,
                     extra_frames=tuple(frames[1:]),
                     observation=_build_observation(job.get("submit")),
+                    frame_detections=frame_detections,
                 )
             job["prepared"] = prepared
             job["local"] = _local_summary(prepared)
@@ -753,7 +796,9 @@ async def identify(
         paths = []
         for index, url in enumerate(urls):
             paths.append(await run_in_threadpool(_download_image, url, directory, index))
-        best_index, frames = _select_best_frame(paths, request_id, app.state.runtime)
+        # _select_best_frame 内含逐帧 ONNX 检测，走线程池避免阻塞事件循环。
+        best_index, frames, frame_detections = await run_in_threadpool(
+            _select_best_frame, paths, request_id, app.state.runtime)
     except HTTPException:
         _discard_dir(directory)
         raise
@@ -765,7 +810,7 @@ async def identify(
         async with app.state.semaphore:
             output = await run_in_threadpool(
                 _run_frames, app.state.runtime, frames,
-                _build_observation(submit_meta)
+                _build_observation(submit_meta), frame_detections
             )
             result = _final_result(
                 output, request_id=request_id, submit=submit_meta,
@@ -822,7 +867,7 @@ async def create_job_async(
             "resultUrl": f"/v1/results/{request_id}", "pollAfterMs": 2000}
 
 
-_LONGPOLL_SECONDS = float(os.getenv("BIRD_RESULT_LONGPOLL_SECONDS", "75"))
+_LONGPOLL_SECONDS = float(os.getenv("BIRD_RESULT_LONGPOLL_SECONDS", "15"))
 
 
 @app.get("/v1/results/{request_id}")
@@ -836,7 +881,8 @@ async def get_result(request: Request, request_id: str,
         log.info("result_fetch requestId=%s status=not_found bytes=0 waitMs=%d remote=%s",
                  request_id, int((time.time() - started) * 1000), remote)
         raise HTTPException(status_code=404, detail="job_not_found")
-    # 长轮询：未完成时挂起等待，兼容“提交后只轮询一次”的调用方。
+    # 短时轮询：未完成时等待一小段时间后返回当前状态；调用方按 pollAfterMs 继续轮询
+    # 或使用 callbackUrl 接收终态，避免单个请求长期占用连接。
     deadline = time.time() + _LONGPOLL_SECONDS
     while job["status"] not in ("done", "error") and time.time() < deadline:
         await asyncio.sleep(0.3)

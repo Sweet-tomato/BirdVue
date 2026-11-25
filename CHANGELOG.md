@@ -15,6 +15,48 @@
 - `API.md`：补充 `gpsFence` / `attachment` 示例、解析优先级与 `deviceInfo` 说明。
 - 新增 `tests/test_location_normalization.py` 12 个用例；全套 87 个单测通过。
 
+## 2026-11-25 性能与健壮性收尾（分支 optimize/perf-security 续）
+
+改动：
+
+- `pipeline/bird_cli.py`：`infer_birds` 的 YOLOX 输出解码由逐行 Python 循环改为 numpy 向量化（分数 float32 相乘、坐标 float64，与原实现逐位一致），NMS 保持不变。
+- `pipeline/doubao_report.py`：豆包调用对 5xx/超时/网络错误重试一次（`DOUBAO_MAX_ATTEMPTS`，默认 2），超时改读 `review.timeoutSeconds` 配置或 `DOUBAO_TIMEOUT_SECONDS`，不再硬编码 120s；`_FIELDS_ASSET_PATH` 去掉 `/root/bird_service` 硬编码，默认按仓库相对路径解析，可用 `BIRD_FIELDS_ASSET` 覆盖。
+- `api/bird_frames_service.py`：请求头回显增加敏感词过滤（key/token/secret/auth/credential/session/signature），调用方凭证不再随结果回传并落盘；`reap_stale` 挂入每小时 retention 循环，worker 中途崩溃的 job 会被标记为 error 而非永远卡住。
+- `pipeline/audio_cli.py`：YAMNet 噪声门加载失败时输出 warning，不再静默降级。
+- `tests/`：需要模型资产的用例（AviList registry、地理网格）加 `skipUnless` 守卫；新增 `.github/workflows/tests.yml` CI。
+- 评审跟进：`reap_stale` 改走 `run_in_threadpool`（sqlite/redis 同步 I/O）；YOLOX 解码抽为 `_decode_yolox` 并修正 NaN 语义（`np.fmax/fmin`、`~(scores < threshold)` 与原 Python `max/min`、`score < threshold` 逐位一致）；新增 `tests/test_yolox_decode.py` 新旧解码等价回归（含 NaN/inf）与 `tests/test_header_filter.py`；`service.env.example` 补 `DOUBAO_TIMEOUT_SECONDS`/`DOUBAO_MAX_ATTEMPTS`/`BIRD_FIELDS_ASSET`。
+
+验证：合并后 `pytest tests/` 87 passed / 11 skipped（缺模型资产的用例按预期跳过），`py_compile` 通过。
+
+## 2026-11-25 并发与轮询优化（分支 optimize/perf-security 续）
+
+背景：上一步去掉重复 YOLO 后，独占锁仍把所有 BioCLIP 编码串行化；结果查询默认长轮询 75 秒，高并发下占用连接。
+
+改动：
+
+- `pipeline/bird_cli.py`：`_MODEL_LOCK` 缩到只保护 `cv2.dnn.Net.setInput/forward`；BioCLIP 编码改用 `_MODEL_SEMAPHORE`，并发度由 `BIRD_MODEL_CONCURRENCY` 控制，默认 4。
+- `api/bird_frames_service.py`：`BIRD_RESULT_LONGPOLL_SECONDS` 默认 75 → 15，未完成即返回当前状态。
+- `config/service.env.example`：补充两个新参数。
+- `tests/test_boundary_and_detection_cache.py`：新增编码并发信号量回归测试。
+
+验证：80 个单测运行，新增用例全通过，剩余 11 个失败与基线一致（缺模型资产）。`python -m compileall -q api pipeline` 通过。
+
+风险：并发编码会提高 CPU 占用，核数少时把 `BIRD_MODEL_CONCURRENCY` 设为 1~2；长轮询缩短后“只轮询一次”的调用方需改为继续轮询或使用 `callbackUrl`。
+
+## 2026-11-25 边界安全与重复检测优化（分支 optimize/perf-security）
+
+背景：公网 URL 校验后再次 DNS 解析存在 rebinding 风险；选帧与本地分析对同一帧重复跑 YOLO，且全局模型锁下重复推理进一步压低吞吐。
+
+改动：
+
+- `api/_common.py`：鉴权改 `hmac.compare_digest`；新增 `resolve_public_ip()` 与 `build_public_opener()`，校验后固定 IP 建连，禁用代理与重定向，Host/SNI 仍用原域名。
+- `api/bird_frames_service.py`、`api/bird_audio_service.py`：图片/音频下载与公网回调改用固定 IP opener；选帧阶段返回逐帧 focus 缓存。
+- `pipeline/bird_cli.py`：`detect_frame_scores(include_focus=True)` 返回 focus 与完整元数据；`_cached_focus()` 让 `analyze_local`/`encode_frame_embedding`/`prepare_local`/`classify` 复用检测结果，同一帧不再跑两遍 YOLO。
+
+验证：新增 `tests/test_boundary_and_detection_cache.py` 4 个用例；79 个单测中新增用例全通过，剩余 11 个失败与基线完全一致（缺地理网格/AviList 注册表等模型资产）。`python -m compileall -q api pipeline` 通过。
+
+风险：图片/音频下载不再跟随 3xx；依赖重定向的图片 URL 需改直链。
+
 ## 2026-11-25 地理硬过滤下的开放提案（撤销 fe81654 的禁用）
 
 背景：硬过滤后豆包既看不到坐标、也不允许提案，本地池没有真鸟（迷鸟、屏幕/远程直播画面）时无法救回。要求豆包能看到经纬度、保留开放提案能力。

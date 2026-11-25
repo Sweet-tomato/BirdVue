@@ -895,9 +895,11 @@ def review_evidence_policy(force_candidate, slots):
     }
 
 
-_FIELDS_ASSET_PATH = Path(
-    "/root/bird_service/models/bioclip25/birds/text_overrides/common_birds_fields_v1.json"
-)
+_FIELDS_ASSET_PATH = Path(os.environ.get(
+    "BIRD_FIELDS_ASSET",
+    Path(__file__).resolve().parents[1] / "models" / "bioclip25" / "birds"
+    / "text_overrides" / "common_birds_fields_v1.json",
+))
 _FIELDS_CACHE = None
 _FIELD_ORDER = ("crest", "head_pattern", "bill", "iris", "wing_marks", "body", "tail_shape", "bare_skin")
 
@@ -1874,17 +1876,34 @@ name 使用完整 eBird 英文常用名，categories 使用双名法拉丁学名
         headers={"Content-Type": "application/json", "Authorization": "Bearer " + api_key},
         method="POST",
     )
+    timeout = float(
+        (local_result.get("pipelineConfig") or {}).get("reviewTimeoutSeconds")
+        or os.environ.get("DOUBAO_TIMEOUT_SECONDS")
+        or 120
+    )
+    max_attempts = max(1, int(os.environ.get("DOUBAO_MAX_ATTEMPTS", "2")))
     started = time.perf_counter()
-    try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            response_payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace")
+    response_payload = None
+    for attempt in range(1, max_attempts + 1):
         try:
-            message = json.loads(body).get("error", {}).get("message") or body
-        except json.JSONDecodeError:
-            message = body
-        raise RuntimeError(f"Doubao request failed ({error.code}): {message}") from error
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as error:
+            body = error.read().decode("utf-8", errors="replace")
+            try:
+                message = json.loads(body).get("error", {}).get("message") or body
+            except json.JSONDecodeError:
+                message = body
+            if not (500 <= error.code < 600) or attempt == max_attempts:
+                raise RuntimeError(f"Doubao request failed ({error.code}): {message}") from error
+            time.sleep(1)
+        except (urllib.error.URLError, TimeoutError, OSError):
+            if attempt == max_attempts:
+                raise
+            time.sleep(1)
+    if response_payload is None:
+        raise RuntimeError("Doubao request failed: no response")
 
     parsed = json.loads(response_text(response_payload))
     if not isinstance(parsed, dict) or "report" not in parsed or "review" not in parsed:

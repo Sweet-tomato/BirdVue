@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import math
 import threading
 import time
 from pathlib import Path
 
 import numpy as np
+
+log = logging.getLogger("bird_audio_cli")
 
 
 DEFAULT_CONFIG = {
@@ -363,6 +366,7 @@ def load_engine(config: dict) -> AudioEngine:
             categories,
             int(merged["numThreads"]),
         )
-    except Exception:  # noise gate is optional; BirdNET still runs
+    except Exception as error:  # noise gate is optional; BirdNET still runs
+        log.warning("yamnet_noise_gate_unavailable error=%s", error)
         noise = None
     return AudioEngine(merged, recognizer, noise, taxonomy)

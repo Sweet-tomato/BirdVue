@@ -33,7 +33,11 @@ SERVICE_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SERVICE_ROOT / "pipeline"))
 
 import audio_cli  # noqa: E402
-from api._common import authorize as _common_authorize, assert_public_host as _common_assert_public_host  # noqa: E402
+from api._common import (  # noqa: E402
+    authorize as _common_authorize,
+    assert_public_host as _common_assert_public_host,
+    build_public_opener as _common_build_public_opener,
+)
 
 CONFIG = Path(os.environ.get("BIRD_CONFIG", SERVICE_ROOT / "config" / "pipeline_config.json"))
 API_KEY = os.environ.get("BIRD_API_KEY", "")
@@ -93,12 +97,11 @@ def _sniff_audio(path: Path) -> str:
 
 
 def _download_audio(url: str, directory: Path) -> Path:
-    """20MB 流式上限 + 魔数校验（wav/flac/ogg/mp3）。"""
-    _assert_public_host(url)
+    """公网 IP 固定 + 20MB 流式上限 + 魔数校验（wav/flac/ogg/mp3）。"""
     tmp = directory / ".audio.part"
     try:
         request = urllib.request.Request(url, headers={"User-Agent": "bird-audio/1.0"})
-        opener = urllib.request.build_opener(_NoRedirect)
+        opener = _common_build_public_opener(url, 'audio', no_redirect=True)
         with opener.open(request, timeout=60) as response, tmp.open("wb") as out:
             total = 0
             while True:

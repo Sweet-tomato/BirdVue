@@ -7,6 +7,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pipeline"))
 
 import doubao_report  # noqa: E402
 
+REGISTRY_MANIFEST = (
+    Path(__file__).resolve().parent.parent / "models" / "bioclip25" / "birds" / "asset_manifest.json"
+)
+needs_registry = unittest.skipUnless(
+    REGISTRY_MANIFEST.is_file(), "AviList asset manifest not present (models/ is not in the repo)"
+)
+
 SETTINGS = {
     "allowConfidentProposal": True,
     "proposalMinimumVisibleFeatures": 2,
@@ -55,6 +62,7 @@ def review(decision="candidate", rank=1, proposal=None, features=None):
 
 
 class ConfidentProposalTests(unittest.TestCase):
+    @needs_registry
     def test_candidate_override_by_same_family_proposal(self):
         rep = dict(REPORT)
         rev = review("candidate", 1, JUNGLE)
@@ -67,6 +75,7 @@ class ConfidentProposalTests(unittest.TestCase):
         self.assertLessEqual(rep["confidence"], 0.4)
         self.assertEqual(rev["openSetProposal"]["overrodeCandidate"]["stableId"], "avibase-B483CC1C")
 
+    @needs_registry
     def test_candidate_kept_when_family_differs(self):
         rep = dict(REPORT)
         proposal = dict(JUNGLE, scientificName="Pica serica", commonName="Oriental Magpie")
@@ -79,6 +88,7 @@ class ConfidentProposalTests(unittest.TestCase):
         )
         self.assertEqual(rep["categories"], "Acridotheres grandis")
 
+    @needs_registry
     def test_candidate_kept_when_selected_rank_not_contradicted(self):
         rep = dict(REPORT)
         proposal = dict(JUNGLE, contradictedCandidateRanks=[2])
@@ -90,6 +100,7 @@ class ConfidentProposalTests(unittest.TestCase):
             [item["reason"] for item in status["rejections"]],
         )
 
+    @needs_registry
     def test_candidate_kept_when_evidence_too_thin(self):
         rep = dict(REPORT)
         proposal = dict(JUNGLE, observedFeatureEvidence=["white wing patch", "yellow bill"])
@@ -101,6 +112,7 @@ class ConfidentProposalTests(unittest.TestCase):
             [item["reason"] for item in status["rejections"]],
         )
 
+    @needs_registry
     def test_reject_all_proposal_accepted_outside_family(self):
         rep = dict(REPORT, canIdentify=False, categories="Unknown", name="Unknown Bird", confidence=0.3)
         proposal = {
@@ -116,6 +128,7 @@ class ConfidentProposalTests(unittest.TestCase):
         self.assertFalse(status["overrodeCandidate"])
         self.assertEqual(rep["categories"], "Chloebia gouldiae")
 
+    @needs_registry
     def test_unresolvable_name_rejected(self):
         rep = dict(REPORT)
         proposal = {
@@ -140,6 +153,7 @@ class ConfidentProposalTests(unittest.TestCase):
         self.assertFalse(status["approved"])
         self.assertEqual(status["reason"], "first_pass_candidate_kept")
 
+    @needs_registry
     def test_geo_filter_bypass_marks_proposal(self):
         rep = dict(REPORT, canIdentify=False, categories="Unknown", name="Unknown Bird", confidence=0.3)
         proposal = {
@@ -156,6 +170,7 @@ class ConfidentProposalTests(unittest.TestCase):
         self.assertTrue(status["geoFilterBypassed"])
         self.assertTrue(rev["openSetProposal"]["geoFilterBypassed"])
 
+    @needs_registry
     def test_geo_filter_bypass_needs_more_evidence(self):
         rep = dict(REPORT, canIdentify=False, categories="Unknown", name="Unknown Bird", confidence=0.3)
         proposal = {

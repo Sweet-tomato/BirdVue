@@ -49,7 +49,11 @@ BIOCLIP_PYTHON_PATH = str(ROOT)
 CROP_MODEL_PATH = ROOT.parent / "models" / "bird-crop-yolox-tiny.onnx"
 SUPPLEMENTAL_SPECIES_PATH = ROOT / "avilist_v2025b_supplemental_species.json"
 SUPPLEMENTAL_EMBEDDINGS_PATH = ROOT / "avilist_v2025b_supplemental_embeddings.npy"
+# 仅保护 cv2.dnn.Net 的 setInput/forward（不是线程安全的）；
+# BioCLIP 图像编码（torch / ONNX Runtime）可并发，改用信号量限制并发度。
 _MODEL_LOCK = threading.Lock()
+MODEL_CONCURRENCY = max(1, int(os.environ.get("BIRD_MODEL_CONCURRENCY", "4")))
+_MODEL_SEMAPHORE = threading.BoundedSemaphore(MODEL_CONCURRENCY)
 TOP_K = 5
 HEAD_RERANK_THRESHOLD = 0.5
 DETECTION_INPUT_SIZE = 416
@@ -378,6 +382,46 @@ def positions(full, tile, overlap_ratio):
     return values
 
 
+def _decode_yolox(rows, width, height, scale):
+    """Decode raw YOLOX rows into pre-NMS candidates (vectorized).
+
+    Bit-equivalent to the original per-cell loop: scores multiply in float32
+    then widen to float64; coords compute in float64; ``np.fmax``/``np.fmin``
+    and ``~(scores < threshold)`` reproduce Python ``max``/``min`` and the
+    ``score < threshold`` skip, including their NaN behavior.
+    """
+    candidates = []
+    offset = 0
+    for stride in (8, 16, 32):
+        size = DETECTION_INPUT_SIZE // stride
+        count = size * size
+        block32 = rows[offset:offset + count]
+        offset += count
+        scores = (block32[:, 4] * block32[:, 5 + BIRD_CLASS_ID]).astype(np.float64)
+        # 原实现 `if score < THRESHOLD: continue` 对 NaN 不跳过，保持一致。
+        keep = np.nonzero(~(scores < DETECTION_THRESHOLD))[0]
+        if keep.size == 0:
+            continue
+        grid_y, grid_x = np.indices((size, size))
+        grid_y = grid_y.reshape(-1)[keep]
+        grid_x = grid_x.reshape(-1)[keep]
+        block = block32[keep].astype(np.float64)
+        center_x = (block[:, 0] + grid_x) * stride
+        center_y = (block[:, 1] + grid_y) * stride
+        box_width = np.exp(np.clip(block[:, 2], -20, 20)) * stride
+        box_height = np.exp(np.clip(block[:, 3], -20, 20)) * stride
+        x1 = np.fmax(0.0, (center_x - box_width / 2) / scale)
+        y1 = np.fmax(0.0, (center_y - box_height / 2) / scale)
+        x2 = np.fmin(float(width), (center_x + box_width / 2) / scale)
+        y2 = np.fmin(float(height), (center_y + box_height / 2) / scale)
+        for i in range(keep.size):
+            candidates.append({
+                "score": float(scores[keep[i]]),
+                "box": [float(x1[i]), float(y1[i]), float(x2[i]), float(y2[i])],
+            })
+    return candidates
+
+
 def infer_birds(image, focus_net):
     import cv2
 
@@ -390,33 +434,11 @@ def infer_birds(image, focus_net):
     canvas = np.full((DETECTION_INPUT_SIZE, DETECTION_INPUT_SIZE, 3), 114, dtype=np.uint8)
     canvas[:resized_height, :resized_width] = resized[:, :, ::-1]
     blob = cv2.dnn.blobFromImage(canvas, scalefactor=1.0, size=(DETECTION_INPUT_SIZE, DETECTION_INPUT_SIZE), swapRB=False, crop=False)
-    focus_net.setInput(blob)
-    rows = np.asarray(focus_net.forward()).reshape(-1, 85)
+    with _MODEL_LOCK:
+        focus_net.setInput(blob)
+        rows = np.asarray(focus_net.forward()).reshape(-1, 85)
 
-    candidates = []
-    index = 0
-    for stride in (8, 16, 32):
-        size = DETECTION_INPUT_SIZE // stride
-        for grid_y in range(size):
-            for grid_x in range(size):
-                row = rows[index]
-                index += 1
-                score = float(row[4] * row[5 + BIRD_CLASS_ID])
-                if score < DETECTION_THRESHOLD:
-                    continue
-                center_x = (float(row[0]) + grid_x) * stride
-                center_y = (float(row[1]) + grid_y) * stride
-                box_width = np.exp(np.clip(float(row[2]), -20, 20)) * stride
-                box_height = np.exp(np.clip(float(row[3]), -20, 20)) * stride
-                candidates.append({
-                    "score": score,
-                    "box": [
-                        max(0.0, (center_x - box_width / 2) / scale),
-                        max(0.0, (center_y - box_height / 2) / scale),
-                        min(float(width), (center_x + box_width / 2) / scale),
-                        min(float(height), (center_y + box_height / 2) / scale),
-                    ],
-                })
+    candidates = _decode_yolox(rows, width, height, scale)
 
     kept = []
     for candidate in sorted(candidates, key=lambda item: item["score"], reverse=True):
@@ -928,21 +950,35 @@ def local_identified_report(local_result):
     return report
 
 
-def encode_frame_embedding(image_path, torch, preprocess, model, focus_net, use_crop):
+def _cached_focus(image_path, frame_detections):
+    """取选帧阶段已算好的 focus，避免同一帧重复检测。"""
+    if not frame_detections:
+        return None, None, False
+    entry = frame_detections.get(str(Path(image_path).resolve()))
+    if not entry:
+        return None, None, False
+    return entry.get("focus"), entry.get("focusMeta"), True
+
+
+def encode_frame_embedding(image_path, torch, preprocess, model, focus_net,
+                           use_crop, frame_detections=None):
     """Encode one extra frame of the same event the same way the main frame is."""
 
     from PIL import Image, ImageOps
 
     with Image.open(image_path) as image:
         original = ImageOps.exif_transpose(image).convert("RGB")
-    with _MODEL_LOCK:
+    cached_focus, cached_meta, cached = _cached_focus(image_path, frame_detections)
+    if cached:
+        detected_focus, focus_meta = cached_focus, cached_meta
+    else:
         detected_focus, focus_meta = create_focus_view(original, focus_net)
     focus = detected_focus if use_crop else None
     views = [original] + ([focus] if focus is not None else [])
     tensor = torch.stack([preprocess(view) for view in views]).to(
         getattr(model, "_inference_device", "cpu")
     )
-    with _MODEL_LOCK, torch.inference_mode():
+    with _MODEL_SEMAPHORE, torch.inference_mode():
         features = torch.nn.functional.normalize(model.encode_image(tensor), dim=-1)
         if focus is not None:
             detection_score = float(focus_meta["score"] or 0)
@@ -956,7 +992,8 @@ def encode_frame_embedding(image_path, torch, preprocess, model, focus_net, use_
     return feature.cpu().numpy(), focus_meta
 
 
-def analyze_local(image_path, runtime, region=None, use_crop=True, extra_frames=(), observation=None):
+def analyze_local(image_path, runtime, region=None, use_crop=True,
+                  extra_frames=(), observation=None, frame_detections=None):
     from PIL import Image, ImageOps
 
     torch, model, preprocess, head, logit_scale, classes, global_labels, common_names, global_text, focus_net = runtime
@@ -965,7 +1002,10 @@ def analyze_local(image_path, runtime, region=None, use_crop=True, extra_frames=
     started = time.perf_counter()
     with Image.open(image_path) as image:
         original = ImageOps.exif_transpose(image).convert("RGB")
-    with _MODEL_LOCK:
+    cached_focus, cached_meta, cached = _cached_focus(image_path, frame_detections)
+    if cached:
+        detected_focus, focus_meta = cached_focus, cached_meta
+    else:
         detected_focus, focus_meta = create_focus_view(original, focus_net)
     focus = detected_focus if use_crop else None
     if not use_crop and detected_focus is not None:
@@ -976,7 +1016,7 @@ def analyze_local(image_path, runtime, region=None, use_crop=True, extra_frames=
     tensor = torch.stack([preprocess(view) for view in views]).to(
         getattr(model, "_inference_device", "cpu")
     )
-    with _MODEL_LOCK, torch.inference_mode():
+    with _MODEL_SEMAPHORE, torch.inference_mode():
         features = torch.nn.functional.normalize(model.encode_image(tensor), dim=-1)
         if focus is not None:
             detection_score = float(focus_meta["score"] or 0)
@@ -1000,7 +1040,7 @@ def analyze_local(image_path, runtime, region=None, use_crop=True, extra_frames=
         if extra is None:
             continue
         extra_feature, extra_focus_meta = encode_frame_embedding(
-            extra, torch, preprocess, model, focus_net, use_crop
+            extra, torch, preprocess, model, focus_net, use_crop, frame_detections
         )
         frame_embeddings.append(extra_feature)
         frame_focus.append(extra_focus_meta)
@@ -1107,7 +1147,7 @@ def analyze_local(image_path, runtime, region=None, use_crop=True, extra_frames=
         detail_tensor = torch.stack(
             [preprocess(item["image"]) for item in detail_views]
         ).to(getattr(model, "_inference_device", "cpu"))
-        with _MODEL_LOCK, torch.inference_mode():
+        with _MODEL_SEMAPHORE, torch.inference_mode():
             detail_embeddings = torch.nn.functional.normalize(
                 model.encode_image(detail_tensor), dim=-1
             ).cpu().numpy()
@@ -1493,6 +1533,7 @@ def analyze_local(image_path, runtime, region=None, use_crop=True, extra_frames=
             "reviewForceCandidate": bool(config["review"].get("forceCandidate", False)),
             "reviewForceAllowsUnknown": bool(config["review"].get("forceAllowsUnknown", False)),
             "reviewMaxCandidates": review_max_candidates,
+            "reviewTimeoutSeconds": config["review"].get("timeoutSeconds"),
             "identificationCards": resolve_card_settings(config),
             "knowledgeGraph": resolve_knowledge_graph_settings(config),
             "openSetEscape": open_set_config,
@@ -1521,14 +1562,15 @@ def analyze_local(image_path, runtime, region=None, use_crop=True, extra_frames=
     return local_result, original, focus
 
 
-def prepare_local(image_path, runtime, region=None, use_crop=True, extra_frames=(), observation=None):
+def prepare_local(image_path, runtime, region=None, use_crop=True,
+                  extra_frames=(), observation=None, frame_detections=None):
     """Run the local BioCLIP chain only. The returned object is handed to
     review_prepared() later; Doubao review is the only async stage."""
     started = time.perf_counter()
     observation_kwargs = {"observation": observation} if observation is not None else {}
     local_result, original, focus = analyze_local(
         image_path, runtime, region=region, use_crop=use_crop, extra_frames=extra_frames,
-        **observation_kwargs,
+        frame_detections=frame_detections, **observation_kwargs,
     )
     config = runtime[1]._pipeline_config
     event_images = None
@@ -1588,12 +1630,16 @@ def _tight_crop(image, box, minimum_side=120, pad_ratio=0.18):
 EVENT_CROP_MIN_SCORE = 0.35
 
 
-def detect_frame_scores(paths, runtime):
+def detect_frame_scores(paths, runtime, include_focus=False):
     """Detect the bird in every frame of one event.
 
     Returns per-frame ``{index, name, box, score, area}``. Used to pick the main
     frame (a detector hit beats a merely sharp frame) and to judge whether a
     per-frame crop is trustworthy enough to send to the review model.
+
+    With ``include_focus=True`` the focus crop and its full metadata are also
+    returned so the local stage can reuse the detection instead of running
+    YOLO a second time on the same frame.
     """
     from PIL import Image, ImageOps
 
@@ -1602,27 +1648,32 @@ def detect_frame_scores(paths, runtime):
     for index, path in enumerate(paths):
         box = None
         score = None
+        focus = None
+        focus_meta = None
         try:
             with Image.open(path) as image:
                 original = ImageOps.exif_transpose(image).convert("RGB")
-            with _MODEL_LOCK:
-                _, meta = create_focus_view(original, focus_net)
-            box = (meta or {}).get("box")
-            score = (meta or {}).get("score")
+            focus, focus_meta = create_focus_view(original, focus_net)
+            box = (focus_meta or {}).get("box")
+            score = (focus_meta or {}).get("score")
         except Exception:  # noqa: BLE001 - a bad frame must not kill the request
-            box, score = None, None
+            box, score, focus, focus_meta = None, None, None, None
         area = 0.0
         if box:
             area = max(0.0, float(box[2]) - float(box[0])) * max(
                 0.0, float(box[3]) - float(box[1])
             )
-        results.append({
+        item = {
             "index": index,
             "name": Path(path).name,
             "box": box,
             "score": float(score or 0.0),
             "area": area,
-        })
+        }
+        if include_focus:
+            item["focus"] = focus
+            item["focusMeta"] = focus_meta
+        results.append(item)
     return results
 
 
@@ -1723,12 +1774,13 @@ def finalize_decision(report, doubao_meta, local_result, decision_source):
     }
 
 
-def classify(image_path, runtime, region=None, use_crop=True, review_mode=None, extra_frames=(), observation=None):
+def classify(image_path, runtime, region=None, use_crop=True, review_mode=None,
+             extra_frames=(), observation=None, frame_detections=None):
     started = time.perf_counter()
     observation_kwargs = {"observation": observation} if observation is not None else {}
     local_result, original, focus = analyze_local(
         image_path, runtime, region=region, use_crop=use_crop, extra_frames=extra_frames,
-        **observation_kwargs,
+        frame_detections=frame_detections, **observation_kwargs,
     )
     config = runtime[1]._pipeline_config
     event_kwargs = {}
