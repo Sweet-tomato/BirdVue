@@ -428,8 +428,10 @@ async def _retention_loop(app: FastAPI) -> None:
     while True:
         await run_in_threadpool(_prune_expired_requests)
         # 周期回收：worker 中途崩溃的 job 会永远卡在非终态，reap 成显式 error。
+        # sqlite/redis 后端是同步 I/O，必须走线程池避免阻塞事件循环。
         try:
-            reaped = app.state.jobs.reap_stale(JOB_TTL_SECONDS)
+            reaped = await run_in_threadpool(
+                app.state.jobs.reap_stale, JOB_TTL_SECONDS)
             if reaped:
                 log.warning("stale_jobs_reaped count=%d ttlSeconds=%d", reaped, JOB_TTL_SECONDS)
         except Exception as error:  # noqa: BLE001
