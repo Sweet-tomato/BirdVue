@@ -250,7 +250,9 @@ def _select_best_frame(paths: list[Path], request_id: str,
     detection_cache: dict[str, Any] = {}
     for item in detection:
         index = int(item.get("index") or 0)
-        if 0 <= index < len(paths):
+        # focusMeta 为 None 说明该帧检测抛过异常；不缓存，让本地阶段走原路重算，
+        # 否则 analyze_local 会拿到 focus_meta=None 直接 AttributeError。
+        if 0 <= index < len(paths) and item.get("focusMeta") is not None:
             detection_cache[str(paths[index].resolve())] = {
                 "focus": item.get("focus"),
                 "focusMeta": item.get("focusMeta"),
@@ -632,8 +634,9 @@ async def _worker(app: FastAPI):
                 for index, url in enumerate(job["imageUrls"])
             ]))
             job["paths"] = [str(p) for p in paths]
-            best_index, frames, frame_detections = _select_best_frame(
-                paths, request_id, app.state.runtime)
+            # _select_best_frame 内含逐帧 ONNX 检测，必须走线程池，否则阻塞事件循环。
+            best_index, frames, frame_detections = await run_in_threadpool(
+                _select_best_frame, paths, request_id, app.state.runtime)
             job["bestImageIndex"] = best_index
             # 本地阶段（检测/裁剪/质量评估）放在后台执行，提交接口不再等待它。
             async with app.state.local_semaphore:
@@ -771,8 +774,9 @@ async def identify(
         paths = []
         for index, url in enumerate(urls):
             paths.append(await run_in_threadpool(_download_image, url, directory, index))
-        best_index, frames, frame_detections = _select_best_frame(
-            paths, request_id, app.state.runtime)
+        # _select_best_frame 内含逐帧 ONNX 检测，走线程池避免阻塞事件循环。
+        best_index, frames, frame_detections = await run_in_threadpool(
+            _select_best_frame, paths, request_id, app.state.runtime)
     except HTTPException:
         _discard_dir(directory)
         raise
